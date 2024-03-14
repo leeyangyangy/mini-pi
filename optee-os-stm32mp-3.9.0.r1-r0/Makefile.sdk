@@ -1,0 +1,24 @@
+LDFLAGS=
+CFLAGS=
+CPPFLAGS=
+
+LOCAL_PATH=$(PWD)
+
+PLATFORM ?= stm32mp1
+CFG_EMBED_DTB_SOURCE_FILE ?=   stm32mp157a-dk1 stm32mp157d-dk1 stm32mp157c-dk2 stm32mp157f-dk2   stm32mp157c-ed1 stm32mp157f-ed1   stm32mp157a-ev1 stm32mp157c-ev1 stm32mp157d-ev1 stm32mp157f-ev1 
+EXTRA_OEMAKE=PLATFORM=stm32mp1                 CROSS_COMPILE_core=arm-ostl-linux-gnueabi-                 CROSS_COMPILE_ta_arm64=arm-ostl-linux-gnueabi-                 CFG_ARM32_core=y CROSS_COMPILE_ta_arm32=arm-ostl-linux-gnueabi-                 NOWERROR=1                 LDFLAGS=                 LIBGCC_LOCATE_CFLAGS=$(OECORE_NATIVE_SYSROOTK)          CFG_TEE_CORE_LOG_LEVEL=2 CFG_TEE_CORE_DEBUG=n comp-cflagscore='$(KCFLAGS)'
+
+all:
+	if test -n "$(CFG_EMBED_DTB_SOURCE_FILE)" ; then \
+		for dt in $(CFG_EMBED_DTB_SOURCE_FILE) ; do \
+			$(MAKE) $(EXTRA_OEMAKE) -C $(LOCAL_PATH) PREFIX=$(SDKTARGETSYSROOT) O=$(LOCAL_PATH)/../build/$$dt CFG_EMBED_DTB_SOURCE_FILE=$$dt.dts ; \
+			cp ../build/$$dt/core/tee-header_v2.stm32 ../build/tee-header_v2-$$dt-optee.stm32 ; \
+			cp ../build/$$dt/core/tee-pager_v2.stm32 ../build/tee-pager_v2-$$dt-optee.stm32 ; \
+			cp ../build/$$dt/core/tee-pageable_v2.stm32 ../build/tee-pageable_v2-$$dt-optee.stm32 ; \
+		done ; \
+	else \
+		$(MAKE) $(EXTRA_OEMAKE) -C $(LOCAL_PATH) PREFIX=$(SDKTARGETSYSROOT) O=$(LOCAL_PATH)/../build/ ; \
+		cp ../build/core/tee-header_v2.stm32 ../build/tee-header_v2-optee.stm32 ; \
+		cp ../build/core/tee-pager_v2.stm32 ../build/tee-pager_v2-optee.stm32 ; \
+		cp ../build/core/tee-pageable_v2.stm32 ../build/tee-pageable_v2-optee.stm32 ; \
+	fi
