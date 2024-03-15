@@ -9,12 +9,12 @@
 #include "stm32mp15xd.dtsi"
 #include "stm32mp15-pinctrl.dtsi"
 #include "stm32mp15xxaa-pinctrl.dtsi"
-#include "stm32mp15xx-edx.dtsi"
+#include "stm32mp157d-atk.dtsi"
 #include <dt-bindings/soc/st,stm32-etzpc.h>
 
 / {
-	model = "STMicroelectronics STM32MP157D eval daughter by leeyangy 2023/03/15 20:40:00";
-	compatible = "st,stm32mp157d-ed1", "st,stm32mp157";
+	model = "STMicroelectronics STM32MP157D eval daughter by leeyangy 2024/03/15 20:40:00";
+	compatible = "st,stm32mp157d-atk", "st,stm32mp157";
 
 	chosen {
 		stdout-path = "serial0:115200n8";
