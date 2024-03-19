@@ -81,9 +81,19 @@
 /* Ethernet need */
 #ifdef CONFIG_DWC_ETH_QOS
 #define CONFIG_SYS_NONCACHED_MEMORY	(1 * SZ_1M)	/* 1M */
-#define CONFIG_SERVERIP                 192.168.1.1
+/* #define CONFIG_SERVERIP                 192.168.1.1 */
 #define CONFIG_BOOTP_SERVERIP
 #define CONFIG_SYS_AUTOLOAD		"no"
+
+/* IP address */
+#define CONFIG_IPADDR 192.168.1.200
+#define CONFIG_GATEWAYIP 192.168.1.1
+#define CONFIG_NETMASK 255.255.255.0
+#define CONFIG_SERVERIP 192.168.1.250
+/* #define CONFIG_ETHADDR b8:ae:1d:01:01:00 */
+/* 随机生成mac地址 */
+#define CONFIG_NET_RANDOM_ETHADDR
+
 #endif
 
 #ifdef CONFIG_DM_VIDEO
