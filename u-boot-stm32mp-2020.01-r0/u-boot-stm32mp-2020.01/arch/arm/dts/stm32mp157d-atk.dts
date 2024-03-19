@@ -88,3 +88,18 @@ panel_rgb: panel-rgb {
 		};
 	};
 };
+
+&ltdc {
+	status = "okay";
+	pinctrl-names = "default";
+	port {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		
+		ltdc_ep0_out: endpoint@0 {
+			reg = <0>;
+			remote-endpoint = <&panel_in_rgb>;
+		};
+	};
+};
+
