@@ -36,6 +36,44 @@
 			no-map;
 		};
 	};
+	
+	// 添加屏幕节点
+	panel_backlight: panel-backlight {
+		compatible = "gpio-backlight";
+		gpios = <&gpiod 13 GPIO_ACTIVE_HIGH>;
+		default-on;
+		status = "okay";
+	};
+	
+	panel_rgb: panel-rgb {
+		compatible = "simple-panel";
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&ltdc_pins_b>;
+		pinctrl-1 = <&ltdc_pins_sleep_b>;
+		backlight = <&panel_backlight>;
+		status = "okay";
+		
+		port {
+			panel_in_rgb: endpoint {
+				remote-endpoint = <&ltdc_ep0_out>;
+			};
+		};
+		
+		display-timings {
+			native-mode = <&timing0>; /* 时序信息 */
+			timing0: timing0 { /* 7 寸 1024*600 分辨率 */
+				clock-frequency = <51200000>; /* LCD 像素时钟，单位 Hz */
+				hactive = <1024>; /* LCD X 轴像素个数 */
+				vactive = <600>; /* LCD Y 轴像素个数 */
+				hfront-porch = <160>; /* LCD hfp 参数 */
+				hback-porch = <140>; /* LCD hbp 参数 */
+				hsync-len = <20>; /* LCD hspw 参数 */
+				vback-porch = <20>; /* LCD vbp 参数 */
+				vfront-porch = <12>; /* LCD vfp 参数 */
+				vsync-len = <3>; /* LCD vspw 参数 */
+			};
+		};
+	};
 };
 
 &cpu1{
@@ -51,44 +89,6 @@
 	status = "okay";
 };
 
-// 添加屏幕节点
-panel_backlight: panel-backlight {
-	compatible = "gpio-backlight";
-	gpios = <&gpiod 13 GPIO_ACTIVE_HIGH>;
-	default-on;
-	status = "okay";
-};
-
-panel_rgb: panel-rgb {
-	compatible = "simple-panel";
-	pinctrl-names = "default", "sleep";
-	pinctrl-0 = <&ltdc_pins_b>;
-	pinctrl-1 = <&ltdc_pins_sleep_b>;
-	backlight = <&panel_backlight>;
-	status = "okay";
-	
-	port {
-		panel_in_rgb: endpoint {
-			remote-endpoint = <&ltdc_ep0_out>;
-		};
-	};
-	
-	display-timings {
-		native-mode = <&timing0>; /* 时序信息 */
-		timing0: timing0 { /* 7 寸 1024*600 分辨率 */
-			clock-frequency = <51200000>; /* LCD 像素时钟，单位 Hz */
-			hactive = <1024>; /* LCD X 轴像素个数 */
-			vactive = <600>; /* LCD Y 轴像素个数 */
-			hfront-porch = <160>; /* LCD hfp 参数 */
-			hback-porch = <140>; /* LCD hbp 参数 */
-			hsync-len = <20>; /* LCD hspw 参数 */
-			vback-porch = <20>; /* LCD vbp 参数 */
-			vfront-porch = <12>; /* LCD vfp 参数 */
-			vsync-len = <3>; /* LCD vspw 参数 */
-		};
-	};
-};
-
 &ltdc {
 	status = "okay";
 	pinctrl-names = "default";
@@ -102,4 +102,3 @@ panel_rgb: panel-rgb {
 		};
 	};
 };
-
