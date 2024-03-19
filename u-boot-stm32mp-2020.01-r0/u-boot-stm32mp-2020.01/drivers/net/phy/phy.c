@@ -209,6 +209,95 @@ int genphy_config_aneg(struct phy_device *phydev)
 	return result;
 }
 
+/***************alientek zuozhongkai add 2021/4/23****************/
+#define YT8511_REG_DEBUG_ADDR_OFFSET		0x1e
+#define YT8511_REG_DEBUG_DATA				0x1f
+
+static int yt8511_rd_ext(struct phy_device *phydev, u32 regnum)
+{
+	int val;
+
+	phy_write(phydev, MDIO_DEVAD_NONE, YT8511_REG_DEBUG_ADDR_OFFSET, regnum);
+	val = phy_read(phydev, MDIO_DEVAD_NONE, YT8511_REG_DEBUG_DATA);
+	
+	return val;
+}
+
+static int yt8511_wr_ext(struct phy_device *phydev, u32 regnum, u16 val)
+{
+	int ret;
+
+	ret = phy_write(phydev, MDIO_DEVAD_NONE, YT8511_REG_DEBUG_ADDR_OFFSET, regnum);
+	ret = phy_write(phydev, MDIO_DEVAD_NONE, YT8511_REG_DEBUG_DATA, val);
+	
+	return ret;
+}
+
+int yt8511_config_txdelay(struct phy_device *phydev, u8 delay)
+{
+        int ret;
+        int val;
+
+        /* disable auto sleep */
+        val = yt8511_rd_ext(phydev, 0x27);
+        if (val < 0)
+                return val;
+
+        val &= (~BIT(15));
+
+        ret = yt8511_wr_ext(phydev, 0x27, val);
+        if (ret < 0)
+                return ret;
+
+        /* enable RXC clock when no wire plug */
+        val = yt8511_rd_ext(phydev, 0xc);
+        if (val < 0)
+                return val;
+
+        /* ext reg 0xc b[7:4]
+		Tx Delay time = 150ps * N – 250ps
+        */
+        val &= ~(0xf << delay);
+		val |= (0x7 << delay);	//150ps * 7 - 250ps
+        ret = yt8511_wr_ext(phydev, 0xc, val);
+
+        return ret;
+}
+
+int yt8511_config_out_125m(struct phy_device *phydev)
+{
+        int ret;
+        int val;
+
+		/* disable auto sleep */
+        val = yt8511_rd_ext(phydev, 0x27);
+        if (val < 0)
+                return val;
+
+        val &= (~BIT(15));
+
+        ret = yt8511_wr_ext(phydev, 0x27, val);
+        if (ret < 0)
+                return ret;
+
+        /* enable RXC clock when no wire plug */
+        val = yt8511_rd_ext(phydev, 0xc);
+        if (val < 0)
+                return val;
+
+        /* ext reg 0xc.b[2:1]
+        00-----25M from pll;
+        01---- 25M from xtl;(default)
+        10-----62.5M from pll;
+        11----125M from pll(here set to this value)
+        */
+        val |= (3 << 1);
+        ret = yt8511_wr_ext(phydev, 0xc, val);
+
+        return ret;
+}
+/*********************end add***************************/
+
 /**
  * genphy_update_link - update link status in @phydev
  * @phydev: target phy_device struct
@@ -220,6 +309,17 @@ int genphy_config_aneg(struct phy_device *phydev)
 int genphy_update_link(struct phy_device *phydev)
 {
 	unsigned int mii_reg;
+
+	/************alientek zuozhongkai add 2021/4/23********/
+	unsigned int phyid1, phyid2;
+
+	phyid1 = phy_read(phydev, MDIO_DEVAD_NONE, MII_PHYSID1);
+	phyid2 = phy_read(phydev, MDIO_DEVAD_NONE, MII_PHYSID2);
+	if((phyid1 == 0X0) && (phyid2 == 0x10a)) {
+		yt8511_config_out_125m(phydev);
+		yt8511_config_txdelay(phydev, 4);
+	}
+	/*********************end add***************************/
 
 	/*
 	 * Wait if the link is up, and autonegotiation is in progress
@@ -433,7 +533,7 @@ int genphy_config(struct phy_device *phydev)
 int genphy_startup(struct phy_device *phydev)
 {
 	int ret;
-
+	
 	ret = genphy_update_link(phydev);
 	if (ret)
 		return ret;
@@ -548,6 +648,7 @@ int phy_init(void)
 #ifdef CONFIG_PHY_XILINX_GMII2RGMII
 	phy_xilinx_gmii2rgmii_init();
 #endif
+
 	genphy_init();
 
 	return 0;
@@ -1010,10 +1111,21 @@ struct phy_device *phy_connect(struct mii_dev *bus, int addr,
 	if (!phydev)
 		phydev = phy_find_by_mask(bus, mask, interface);
 
+	/***********zuozhongkai add 2021/4/23****************/	
+	if (!phydev) /* 如果还没有获取到phy_device，尝试YT8511 	*/
+	{
+		addr = 0;
+		mask = (addr >= 0) ? (1 << addr) : 0xffffffff;
+		phydev = phy_find_by_mask(bus, mask, interface);	
+	}
+	/******************end add****************************/
+
 	if (phydev)
 		phy_connect_dev(phydev, dev);
 	else
 		printf("Could not get PHY for %s: addr %d\n", bus->name, addr);
+
+
 	return phydev;
 }
 
