@@ -28,6 +28,8 @@
 #include <linux/input/mt.h>
 #include <linux/input/touchscreen.h>
 #include <asm/unaligned.h>
+#include <linux/of_device.h>
+#include <drm/drm_mipi_dsi.h>
 
 #define WORK_REGISTER_THRESHOLD		0x00
 #define WORK_REGISTER_REPORT_RATE	0x08
@@ -1042,6 +1044,8 @@ static int edt_ft5x06_ts_probe(struct i2c_client *client,
 	const struct edt_i2c_chip_data *chip_data;
 	struct edt_ft5x06_ts_data *tsdata;
 	u8 buf[2] = { 0xfc, 0x00 };
+	struct mipi_dsi_device *panel;
+	struct device_node *np;
 	struct input_dev *input;
 	unsigned long irq_flags;
 	int error;
@@ -1107,7 +1111,7 @@ static int edt_ft5x06_ts_probe(struct i2c_client *client,
 
 	error = edt_ft5x06_ts_identify(client, tsdata, fw_version);
 	if (error) {
-		dev_err(&client->dev, "touchscreen probe failed\n");
+		dev_dbg(&client->dev, "touchscreen probe failed\n");
 		return error;
 	}
 
@@ -1175,6 +1179,18 @@ static int edt_ft5x06_ts_probe(struct i2c_client *client,
 	error = input_register_device(input);
 	if (error)
 		return error;
+
+	np = of_parse_phandle(client->dev.of_node, "panel", 0);
+	if (np) {
+		panel = of_find_mipi_dsi_device_by_node(np);
+		of_node_put(np);
+		if (!panel)
+			return -EPROBE_DEFER;
+
+		device_link_add(&client->dev, &panel->dev, DL_FLAG_STATELESS |
+				DL_FLAG_AUTOREMOVE_SUPPLIER);
+		put_device(&panel->dev);
+	}
 
 	edt_ft5x06_ts_prepare_debugfs(tsdata, dev_driver_string(&client->dev));
 	device_init_wakeup(&client->dev, 1);

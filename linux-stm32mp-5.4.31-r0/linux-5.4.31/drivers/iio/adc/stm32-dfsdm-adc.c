@@ -10,6 +10,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/iio/adc/stm32-dfsdm-adc.h>
 #include <linux/iio/buffer.h>
+#include <linux/iio/consumer.h>
 #include <linux/iio/hw-consumer.h>
 #include <linux/iio/sysfs.h>
 #include <linux/iio/timer/stm32-lptim-trigger.h>
@@ -67,6 +68,13 @@ struct stm32_dfsdm_dev_data {
 	const struct regmap_config *regmap_cfg;
 };
 
+struct stm32_dfsdm_sd_chan_info {
+	int scale_val;
+	int scale_val2;
+	int offset;
+	unsigned int differential;
+};
+
 struct stm32_dfsdm_adc {
 	struct stm32_dfsdm *dfsdm;
 	const struct stm32_dfsdm_dev_data *dev_data;
@@ -79,6 +87,7 @@ struct stm32_dfsdm_adc {
 	struct iio_hw_consumer *hwc;
 	struct completion completion;
 	u32 *buffer;
+	struct stm32_dfsdm_sd_chan_info *sd_chan;
 
 	/* Audio specific */
 	unsigned int spi_freq;  /* SPI bus clock frequency */
@@ -1199,14 +1208,32 @@ static int stm32_dfsdm_write_raw(struct iio_dev *indio_dev,
 	unsigned int spi_freq;
 	int ret = -EINVAL;
 
+	switch (ch->src) {
+	case DFSDM_CHANNEL_SPI_CLOCK_INTERNAL:
+		spi_freq = adc->dfsdm->spi_master_freq;
+		break;
+	case DFSDM_CHANNEL_SPI_CLOCK_INTERNAL_DIV2_FALLING:
+	case DFSDM_CHANNEL_SPI_CLOCK_INTERNAL_DIV2_RISING:
+		spi_freq = adc->dfsdm->spi_master_freq / 2;
+		break;
+	default:
+		spi_freq = adc->spi_freq;
+	}
+
 	switch (mask) {
 	case IIO_CHAN_INFO_OVERSAMPLING_RATIO:
 		ret = iio_device_claim_direct_mode(indio_dev);
 		if (ret)
 			return ret;
+
 		ret = stm32_dfsdm_compute_all_osrs(indio_dev, val);
-		if (!ret)
+		if (!ret) {
+			dev_dbg(&indio_dev->dev,
+				"Sampling rate changed from (%u) to (%u)\n",
+				adc->sample_freq, spi_freq / val);
 			adc->oversamp = val;
+			adc->sample_freq = spi_freq / val;
+		}
 		iio_device_release_direct_mode(indio_dev);
 		return ret;
 
@@ -1217,18 +1244,6 @@ static int stm32_dfsdm_write_raw(struct iio_dev *indio_dev,
 		ret = iio_device_claim_direct_mode(indio_dev);
 		if (ret)
 			return ret;
-
-		switch (ch->src) {
-		case DFSDM_CHANNEL_SPI_CLOCK_INTERNAL:
-			spi_freq = adc->dfsdm->spi_master_freq;
-			break;
-		case DFSDM_CHANNEL_SPI_CLOCK_INTERNAL_DIV2_FALLING:
-		case DFSDM_CHANNEL_SPI_CLOCK_INTERNAL_DIV2_RISING:
-			spi_freq = adc->dfsdm->spi_master_freq / 2;
-			break;
-		default:
-			spi_freq = adc->spi_freq;
-		}
 
 		ret = dfsdm_adc_set_samp_freq(indio_dev, val, spi_freq);
 		iio_device_release_direct_mode(indio_dev);
@@ -1243,7 +1258,10 @@ static int stm32_dfsdm_read_raw(struct iio_dev *indio_dev,
 				int *val2, long mask)
 {
 	struct stm32_dfsdm_adc *adc = iio_priv(indio_dev);
-	int ret;
+	struct stm32_dfsdm_filter *fl = &adc->dfsdm->fl_list[adc->fl_id];
+	struct stm32_dfsdm_filter_osr *flo = &fl->flo[fl->fast];
+	u32 max = flo->max << (flo->lshift - chan->scan_type.shift);
+	int ret, idx = chan->scan_index;
 
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
@@ -1278,6 +1296,39 @@ static int stm32_dfsdm_read_raw(struct iio_dev *indio_dev,
 	case IIO_CHAN_INFO_SAMP_FREQ:
 		*val = adc->sample_freq;
 
+		return IIO_VAL_INT;
+
+	case IIO_CHAN_INFO_SCALE:
+		/*
+		 * Scale is expressed in mV.
+		 * When fast mode is disabled, actual resolution may be lower
+		 * than 2^n, where n=realbits-1.
+		 * This leads to underestimating input voltage. To
+		 * compensate this deviation, the voltage reference can be
+		 * corrected with a factor = realbits resolution / actual max
+		 */
+		*val = div_u64((u64)adc->sd_chan[idx].scale_val *
+			       (u64)BIT(DFSDM_DATA_RES - 1), max);
+		*val2 = chan->scan_type.realbits;
+		if (adc->sd_chan[idx].differential)
+			*val *= 2;
+		return IIO_VAL_FRACTIONAL_LOG2;
+
+	case IIO_CHAN_INFO_OFFSET:
+		/*
+		 * DFSDM output data are in the range [-2^n,2^n-1],
+		 * with n=realbits-1.
+		 * - Differential modulator:
+		 * Offset correspond to SD modulator offset.
+		 * - Single ended modulator:
+		 * Input is in [0V,Vref] range, where 0V corresponds to -2^n.
+		 * Add 2^n to offset. (i.e. middle of input range)
+		 * offset = offset(sd) * vref / res(sd) * max / vref.
+		 */
+		*val = div_u64((u64)max * adc->sd_chan[idx].offset,
+			       BIT(adc->sd_chan[idx].scale_val2 - 1));
+		if (!adc->sd_chan[idx].differential)
+			*val += max;
 		return IIO_VAL_INT;
 	}
 
@@ -1363,9 +1414,13 @@ static int stm32_dfsdm_dma_request(struct iio_dev *indio_dev)
 {
 	struct stm32_dfsdm_adc *adc = iio_priv(indio_dev);
 
-	adc->dma_chan = dma_request_slave_channel(&indio_dev->dev, "rx");
-	if (!adc->dma_chan)
-		return -EINVAL;
+	adc->dma_chan = dma_request_chan(&indio_dev->dev, "rx");
+	if (IS_ERR(adc->dma_chan)) {
+		int ret = PTR_ERR(adc->dma_chan);
+
+		adc->dma_chan = NULL;
+		return ret;
+	}
 
 	adc->rx_buf = dma_alloc_coherent(adc->dma_chan->device->dev,
 					 DFSDM_DMA_BUFFER_SIZE,
@@ -1398,7 +1453,9 @@ static int stm32_dfsdm_adc_chan_init_one(struct iio_dev *indio_dev,
 	 * IIO_CHAN_INFO_RAW: used to compute regular conversion
 	 * IIO_CHAN_INFO_OVERSAMPLING_RATIO: used to set oversampling
 	 */
-	ch->info_mask_separate = BIT(IIO_CHAN_INFO_RAW);
+	ch->info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |
+				 BIT(IIO_CHAN_INFO_SCALE) |
+				 BIT(IIO_CHAN_INFO_OFFSET);
 	ch->info_mask_shared_by_all = BIT(IIO_CHAN_INFO_OVERSAMPLING_RATIO) |
 					BIT(IIO_CHAN_INFO_SAMP_FREQ);
 
@@ -1408,7 +1465,7 @@ static int stm32_dfsdm_adc_chan_init_one(struct iio_dev *indio_dev,
 		ch->scan_type.shift = 8;
 	}
 	ch->scan_type.sign = 's';
-	ch->scan_type.realbits = 24;
+	ch->scan_type.realbits = DFSDM_DATA_RES;
 	ch->scan_type.storagebits = 32;
 
 	return stm32_dfsdm_chan_configure(adc->dfsdm,
@@ -1449,8 +1506,10 @@ static int stm32_dfsdm_adc_init(struct iio_dev *indio_dev)
 {
 	struct iio_chan_spec *ch;
 	struct stm32_dfsdm_adc *adc = iio_priv(indio_dev);
+	struct iio_channel *channels, *chan;
+	struct stm32_dfsdm_sd_chan_info *sd_chan;
 	int num_ch;
-	int ret, chan_idx;
+	int ret, chan_idx, val2;
 
 	adc->oversamp = DFSDM_DEFAULT_OVERSAMPLING;
 	ret = stm32_dfsdm_compute_all_osrs(indio_dev, adc->oversamp);
@@ -1474,6 +1533,21 @@ static int stm32_dfsdm_adc_init(struct iio_dev *indio_dev)
 	if (!ch)
 		return -ENOMEM;
 
+	/* Get SD modulator channels */
+	channels = iio_channel_get_all(&indio_dev->dev);
+	if (IS_ERR(channels)) {
+		dev_err(&indio_dev->dev, "Failed to get channel %ld\n",
+			PTR_ERR(channels));
+		return PTR_ERR(channels);
+	}
+	chan = &channels[0];
+
+	adc->sd_chan = devm_kzalloc(&indio_dev->dev,
+				    sizeof(*adc->sd_chan) * num_ch, GFP_KERNEL);
+	if (!adc->sd_chan)
+		return -ENOMEM;
+	sd_chan = adc->sd_chan;
+
 	for (chan_idx = 0; chan_idx < num_ch; chan_idx++) {
 		ch[chan_idx].scan_index = chan_idx;
 		ret = stm32_dfsdm_adc_chan_init_one(indio_dev, &ch[chan_idx]);
@@ -1481,6 +1555,38 @@ static int stm32_dfsdm_adc_init(struct iio_dev *indio_dev)
 			dev_err(&indio_dev->dev, "Channels init failed\n");
 			return ret;
 		}
+
+		if (!chan->indio_dev)
+			return -EINVAL;
+
+		ret = iio_read_channel_scale(chan, &sd_chan->scale_val,
+					     &sd_chan->scale_val2);
+		if (ret < 0) {
+			dev_err(&indio_dev->dev,
+				"Failed to get channel %d scale\n", chan_idx);
+			return ret;
+		}
+
+		if (iio_channel_has_info(chan->channel, IIO_CHAN_INFO_OFFSET)) {
+			ret = iio_read_channel_offset(chan, &sd_chan->offset,
+						      &val2);
+			if (ret < 0) {
+				dev_err(&indio_dev->dev,
+					"Failed to get channel %d offset\n",
+					chan_idx);
+				return ret;
+			}
+		}
+
+		sd_chan->differential = chan->channel->differential;
+
+		dev_dbg(&indio_dev->dev, "Channel %d %s scale ref=%d offset=%d",
+			chan_idx, chan->channel->differential ?
+			"differential" : "single-ended",
+			sd_chan->scale_val, sd_chan->offset);
+
+		chan++;
+		sd_chan++;
 	}
 
 	indio_dev->num_channels = num_ch;
@@ -1489,7 +1595,16 @@ static int stm32_dfsdm_adc_init(struct iio_dev *indio_dev)
 	init_completion(&adc->completion);
 
 	/* Optionally request DMA */
-	if (stm32_dfsdm_dma_request(indio_dev)) {
+	ret = stm32_dfsdm_dma_request(indio_dev);
+	if (ret) {
+		if (ret != -ENODEV) {
+			if (ret != -EPROBE_DEFER)
+				dev_err(&indio_dev->dev,
+					"DMA channel request failed with %d\n",
+					ret);
+			return ret;
+		}
+
 		dev_dbg(&indio_dev->dev, "No DMA support\n");
 		return 0;
 	}

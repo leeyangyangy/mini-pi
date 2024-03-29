@@ -507,6 +507,7 @@ static int stm32_hash_hmac_dma_send(struct stm32_hash_dev *hdev)
 static int stm32_hash_dma_init(struct stm32_hash_dev *hdev)
 {
 	struct dma_slave_config dma_conf;
+	struct dma_chan *chan;
 	int err;
 
 	memset(&dma_conf, 0, sizeof(dma_conf));
@@ -518,11 +519,11 @@ static int stm32_hash_dma_init(struct stm32_hash_dev *hdev)
 	dma_conf.dst_maxburst = hdev->dma_maxburst;
 	dma_conf.device_fc = false;
 
-	hdev->dma_lch = dma_request_slave_channel(hdev->dev, "in");
-	if (!hdev->dma_lch) {
-		dev_err(hdev->dev, "Couldn't acquire a slave DMA channel.\n");
-		return -EBUSY;
-	}
+	chan = dma_request_chan(hdev->dev, "in");
+	if (IS_ERR(chan))
+		return PTR_ERR(chan);
+
+	hdev->dma_lch = chan;
 
 	err = dmaengine_slave_config(hdev->dma_lch, &dma_conf);
 	if (err) {
@@ -923,14 +924,9 @@ static int stm32_hash_final(struct ahash_request *req)
 static int stm32_hash_finup(struct ahash_request *req)
 {
 	struct stm32_hash_request_ctx *rctx = ahash_request_ctx(req);
-	struct stm32_hash_ctx *ctx = crypto_ahash_ctx(crypto_ahash_reqtfm(req));
-	struct stm32_hash_dev *hdev = stm32_hash_find_dev(ctx);
 	int err1, err2;
 
 	rctx->flags |= HASH_FLAGS_FINUP;
-
-	if (hdev->dma_lch && stm32_hash_dma_aligned_data(req))
-		rctx->flags &= ~HASH_FLAGS_CPU;
 
 	err1 = stm32_hash_update(req);
 
@@ -948,7 +944,19 @@ static int stm32_hash_finup(struct ahash_request *req)
 
 static int stm32_hash_digest(struct ahash_request *req)
 {
-	return stm32_hash_init(req) ?: stm32_hash_finup(req);
+	int ret;
+	struct stm32_hash_request_ctx *rctx = ahash_request_ctx(req);
+	struct stm32_hash_ctx *ctx = crypto_ahash_ctx(crypto_ahash_reqtfm(req));
+	struct stm32_hash_dev *hdev = stm32_hash_find_dev(ctx);
+
+	ret = stm32_hash_init(req);
+	if (ret)
+		return ret;
+
+	if (hdev->dma_lch && stm32_hash_dma_aligned_data(req))
+		rctx->flags &= ~HASH_FLAGS_CPU;
+
+	return stm32_hash_finup(req);
 }
 
 static int stm32_hash_export(struct ahash_request *req, void *out)
@@ -1463,8 +1471,11 @@ static int stm32_hash_probe(struct platform_device *pdev)
 
 	hdev->clk = devm_clk_get(&pdev->dev, NULL);
 	if (IS_ERR(hdev->clk)) {
-		dev_err(dev, "failed to get clock for hash (%lu)\n",
-			PTR_ERR(hdev->clk));
+		if (PTR_ERR(hdev->clk) != -EPROBE_DEFER) {
+			dev_err(dev, "failed to get clock for hash (%lu)\n",
+				PTR_ERR(hdev->clk));
+		}
+
 		return PTR_ERR(hdev->clk);
 	}
 
@@ -1482,7 +1493,12 @@ static int stm32_hash_probe(struct platform_device *pdev)
 	pm_runtime_enable(dev);
 
 	hdev->rst = devm_reset_control_get(&pdev->dev, NULL);
-	if (!IS_ERR(hdev->rst)) {
+	if (IS_ERR(hdev->rst)) {
+		if (PTR_ERR(hdev->rst) == -EPROBE_DEFER) {
+			ret = -EPROBE_DEFER;
+			goto err_reset;
+		}
+	} else {
 		reset_control_assert(hdev->rst);
 		udelay(2);
 		reset_control_deassert(hdev->rst);
@@ -1493,8 +1509,15 @@ static int stm32_hash_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, hdev);
 
 	ret = stm32_hash_dma_init(hdev);
-	if (ret)
+	switch (ret) {
+	case 0:
+		break;
+	case -ENOENT:
 		dev_dbg(dev, "DMA mode not available\n");
+		break;
+	default:
+		goto err_dma;
+	}
 
 	spin_lock(&stm32_hash.lock);
 	list_add_tail(&hdev->list, &stm32_hash.dev_list);
@@ -1532,10 +1555,10 @@ err_engine:
 	spin_lock(&stm32_hash.lock);
 	list_del(&hdev->list);
 	spin_unlock(&stm32_hash.lock);
-
+err_dma:
 	if (hdev->dma_lch)
 		dma_release_channel(hdev->dma_lch);
-
+err_reset:
 	pm_runtime_disable(dev);
 	pm_runtime_put_noidle(dev);
 

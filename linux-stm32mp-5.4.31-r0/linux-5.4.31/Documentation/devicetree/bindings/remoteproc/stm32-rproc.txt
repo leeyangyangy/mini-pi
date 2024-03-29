@@ -21,6 +21,9 @@ Required properties:
 
 Optional properties:
 - interrupts:	Should contain the watchdog interrupt
+- wakeup-source: Flag indicating whether remoteproc can wake up the system by
+		the watchdog interrupt. Only meaningful if the "interrupts"
+		property is defined.
 - mboxes:	This property is required only if the rpmsg/virtio functionality
 		is used. List of phandle and mailbox channel specifiers:
 		- a channel (a) used to communicate through virtqueues with the
@@ -48,6 +51,16 @@ Optional properties:
 	1st cell: phandle to syscon block
 	2nd cell: register offset containing the deep sleep setting
 	3rd cell: register bitmask for the deep sleep bit
+- st,syscfg-rsc-tbl: Reference to the system configuration controlling the
+		resource table address loaded by the bootloader
+	1st cell: phandle to syscon block
+	2nd cell: register offset containing the resource table address
+	3rd cell: register bitmask for the resource table address
+- st,syscfg-copro-state: Reference to the system configuration which returns the
+		coprocessor state.
+	1st cell: phandle to syscon block
+	2nd cell: register offset containing the coprocessor state
+	3rd cell: register bitmask for the coprocessor state
 - st,auto-boot:	If defined, when remoteproc is probed, it loads the default
 		firmware and starts the remote processor.
 

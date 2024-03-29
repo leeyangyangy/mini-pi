@@ -95,6 +95,9 @@ enum state {
 #define MIN_HEIGHT	16U
 #define MAX_HEIGHT	2592U
 
+/* DMA can sustain YUV 720p@15fps max */
+#define MAX_DMA_BANDWIDTH	(1280 * 720 * 2 * 15)
+
 #define TIMEOUT_MS	1000
 
 #define OVERRUN_ERROR_THRESHOLD	3
@@ -324,7 +327,7 @@ static int dcmi_start_dma(struct stm32_dcmi *dcmi,
 	}
 
 	/*
-	 * Avoid call of dmaengine_terminate_all() between
+	 * Avoid call of dmaengine_terminate_sync() between
 	 * dmaengine_prep_slave_single() and dmaengine_submit()
 	 * by locking the whole DMA submission sequence
 	 */
@@ -438,7 +441,7 @@ static void dcmi_process_jpeg(struct stm32_dcmi *dcmi)
 	}
 
 	/* Abort DMA operation */
-	dmaengine_terminate_all(dcmi->dma_chan);
+	dmaengine_terminate_sync(dcmi->dma_chan);
 
 	/* Restart capture */
 	if (dcmi_restart_capture(dcmi))
@@ -784,8 +787,31 @@ static int dcmi_start_streaming(struct vb2_queue *vq, unsigned int count)
 		dcmi_set_crop(dcmi);
 
 	/* Enable jpeg capture */
-	if (dcmi->sd_format->fourcc == V4L2_PIX_FMT_JPEG)
-		reg_set(dcmi->regs, DCMI_CR, CR_CM);/* Snapshot mode */
+	if (dcmi->sd_format->fourcc == V4L2_PIX_FMT_JPEG) {
+		unsigned int rate;
+		struct v4l2_streamparm p = {
+			.type = V4L2_BUF_TYPE_VIDEO_CAPTURE
+		};
+		struct v4l2_fract frame_interval = {1, 30};
+
+		ret = v4l2_g_parm_cap(dcmi->vdev, dcmi->entity.source, &p);
+		if (!ret)
+			frame_interval = p.parm.capture.timeperframe;
+
+		rate = dcmi->fmt.fmt.pix.sizeimage *
+		       frame_interval.denominator / frame_interval.numerator;
+
+		/*
+		 * If rate exceed DMA capabilities, switch to snapshot mode
+		 * to ensure that current DMA transfer is elapsed before
+		 * capturing a new JPEG.
+		 */
+		if (rate > MAX_DMA_BANDWIDTH) {
+			reg_set(dcmi->regs, DCMI_CR, CR_CM);/* Snapshot mode */
+			dev_dbg(dcmi->dev, "Capture rate is too high for continuous mode (%d > %d bytes/s), switch to snapshot mode\n",
+				rate, MAX_DMA_BANDWIDTH);
+		}
+	}
 
 	/* Enable dcmi */
 	reg_set(dcmi->regs, DCMI_CR, CR_ENABLE);
@@ -884,7 +910,7 @@ static void dcmi_stop_streaming(struct vb2_queue *vq)
 
 	/* Stop all pending DMA operations */
 	mutex_lock(&dcmi->dma_lock);
-	dmaengine_terminate_all(dcmi->dma_chan);
+	dmaengine_terminate_sync(dcmi->dma_chan);
 	mutex_unlock(&dcmi->dma_lock);
 
 	pm_runtime_put(dcmi->dev);
@@ -1853,7 +1879,9 @@ static int dcmi_probe(struct platform_device *pdev)
 
 	dcmi->rstc = devm_reset_control_get_exclusive(&pdev->dev, NULL);
 	if (IS_ERR(dcmi->rstc)) {
-		dev_err(&pdev->dev, "Could not get reset control\n");
+		if (PTR_ERR(dcmi->rstc) != -EPROBE_DEFER)
+			dev_err(&pdev->dev, "Could not get reset control\n");
+
 		return PTR_ERR(dcmi->rstc);
 	}
 
@@ -1910,10 +1938,13 @@ static int dcmi_probe(struct platform_device *pdev)
 		return PTR_ERR(mclk);
 	}
 
-	chan = dma_request_slave_channel(&pdev->dev, "tx");
-	if (!chan) {
-		dev_info(&pdev->dev, "Unable to request DMA channel, defer probing\n");
-		return -EPROBE_DEFER;
+	chan = dma_request_chan(&pdev->dev, "tx");
+	if (IS_ERR(chan)) {
+		ret = PTR_ERR(chan);
+		if (ret != -EPROBE_DEFER)
+			dev_err(&pdev->dev,
+				"Failed to request DMA channel: %d\n", ret);
+		return ret;
 	}
 
 	spin_lock_init(&dcmi->irqlock);

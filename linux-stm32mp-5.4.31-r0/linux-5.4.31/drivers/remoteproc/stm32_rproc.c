@@ -15,9 +15,11 @@
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_reserved_mem.h>
+#include <linux/pm_wakeirq.h>
 #include <linux/regmap.h>
 #include <linux/remoteproc.h>
 #include <linux/reset.h>
+#include <linux/workqueue.h>
 
 #include "remoteproc_internal.h"
 
@@ -31,8 +33,19 @@
 #define STM32_SMC_REG_WRITE	0x1
 
 #define STM32_MBX_VQ0		"vq0"
+#define STM32_MBX_VQ0_ID	0
 #define STM32_MBX_VQ1		"vq1"
+#define STM32_MBX_VQ1_ID	1
 #define STM32_MBX_SHUTDOWN	"shutdown"
+
+#define RSC_TBL_SIZE		(1024)
+
+#define COPRO_STATE_OFF		0
+#define COPRO_STATE_INIT	1
+#define COPRO_STATE_CRUN	2
+#define COPRO_STATE_CSTOP	3
+#define COPRO_STATE_STANDBY	4
+#define COPRO_STATE_CRASH	5
 
 struct stm32_syscon {
 	struct regmap *map;
@@ -58,6 +71,7 @@ struct stm32_mbox {
 	const unsigned char name[10];
 	struct mbox_chan *chan;
 	struct mbox_client client;
+	struct work_struct vq_work;
 	int vq_id;
 };
 
@@ -65,10 +79,14 @@ struct stm32_rproc {
 	struct reset_control *rst;
 	struct stm32_syscon hold_boot;
 	struct stm32_syscon pdds;
+	struct stm32_syscon copro_state;
+	int wdg_irq;
 	u32 nb_rmems;
 	struct stm32_rproc_mem *rmems;
 	struct stm32_mbox mb[MBOX_NB_MBX];
+	struct workqueue_struct *workqueue;
 	bool secured_soc;
+	void __iomem *rsc_va;
 };
 
 static int stm32_rproc_pa_to_da(struct rproc *rproc, phys_addr_t pa, u64 *da)
@@ -87,6 +105,28 @@ static int stm32_rproc_pa_to_da(struct rproc *rproc, phys_addr_t pa, u64 *da)
 		dev_dbg(rproc->dev.parent, "pa %pa to da %llx\n", &pa, *da);
 		return 0;
 	}
+
+	return -EINVAL;
+}
+
+static int stm32_rproc_da_to_pa(struct rproc *rproc, u64 da, phys_addr_t *pa)
+{
+	unsigned int i;
+	struct stm32_rproc *ddata = rproc->priv;
+	struct stm32_rproc_mem *p_mem;
+
+	for (i = 0; i < ddata->nb_rmems; i++) {
+		p_mem = &ddata->rmems[i];
+
+		if (da < p_mem->dev_addr ||
+		    da >= p_mem->dev_addr + p_mem->size)
+			continue;
+		*pa = da - p_mem->dev_addr + p_mem->bus_addr;
+		dev_dbg(rproc->dev.parent, "da %llx to pa %#x\n", da, *pa);
+		return 0;
+	}
+
+	dev_err(rproc->dev.parent, "can't translate da %llx\n", da);
 
 	return -EINVAL;
 }
@@ -116,6 +156,15 @@ static int stm32_rproc_mem_release(struct rproc *rproc,
 {
 	dev_dbg(rproc->dev.parent, "unmap memory: %pa\n", &mem->dma);
 	iounmap(mem->va);
+
+	return 0;
+}
+
+static int stm32_rproc_elf_load_segments(struct rproc *rproc,
+					 const struct firmware *fw)
+{
+	if (!rproc->early_boot)
+		return rproc_elf_load_segments(rproc, fw);
 
 	return 0;
 }
@@ -190,9 +239,34 @@ static int stm32_rproc_mbox_idx(struct rproc *rproc, const unsigned char *name)
 static int stm32_rproc_elf_load_rsc_table(struct rproc *rproc,
 					  const struct firmware *fw)
 {
-	if (rproc_elf_load_rsc_table(rproc, fw))
-		dev_warn(&rproc->dev, "no resource table found for this firmware\n");
+	struct resource_table *table = NULL;
+	struct stm32_rproc *ddata = rproc->priv;
 
+	if (!rproc->early_boot) {
+		if (rproc_elf_load_rsc_table(rproc, fw))
+			goto no_rsc_table;
+
+		return 0;
+	}
+
+	if (ddata->rsc_va) {
+		table = (struct resource_table *)ddata->rsc_va;
+		/* Assuming that the resource table fits in 1kB is fair */
+		rproc->cached_table = kmemdup(table, RSC_TBL_SIZE, GFP_KERNEL);
+		if (!rproc->cached_table)
+			return -ENOMEM;
+
+		rproc->table_ptr = rproc->cached_table;
+		rproc->table_sz = RSC_TBL_SIZE;
+		return 0;
+	}
+
+	rproc->cached_table = NULL;
+	rproc->table_ptr = NULL;
+	rproc->table_sz = 0;
+
+no_rsc_table:
+	dev_warn(&rproc->dev, "no resource table found for this firmware\n");
 	return 0;
 }
 
@@ -252,6 +326,36 @@ static int stm32_rproc_parse_fw(struct rproc *rproc, const struct firmware *fw)
 	return stm32_rproc_elf_load_rsc_table(rproc, fw);
 }
 
+static struct resource_table *
+stm32_rproc_elf_find_loaded_rsc_table(struct rproc *rproc,
+				      const struct firmware *fw)
+{
+	struct stm32_rproc *ddata = rproc->priv;
+
+	if (!rproc->early_boot)
+		return rproc_elf_find_loaded_rsc_table(rproc, fw);
+
+	return (struct resource_table *)ddata->rsc_va;
+}
+
+static int stm32_rproc_elf_sanity_check(struct rproc *rproc,
+					const struct firmware *fw)
+{
+	if (!rproc->early_boot)
+		return rproc_elf_sanity_check(rproc, fw);
+
+	return 0;
+}
+
+static u32 stm32_rproc_elf_get_boot_addr(struct rproc *rproc,
+					 const struct firmware *fw)
+{
+	if (!rproc->early_boot)
+		return rproc_elf_get_boot_addr(rproc, fw);
+
+	return 0;
+}
+
 static irqreturn_t stm32_rproc_wdg(int irq, void *data)
 {
 	struct rproc *rproc = data;
@@ -261,13 +365,22 @@ static irqreturn_t stm32_rproc_wdg(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+static void stm32_rproc_mb_vq_work(struct work_struct *work)
+{
+	struct stm32_mbox *mb = container_of(work, struct stm32_mbox, vq_work);
+	struct rproc *rproc = dev_get_drvdata(mb->client.dev);
+
+	if (rproc_vq_interrupt(rproc, mb->vq_id) == IRQ_NONE)
+		dev_dbg(&rproc->dev, "no message found in vq%d\n", mb->vq_id);
+}
+
 static void stm32_rproc_mb_callback(struct mbox_client *cl, void *data)
 {
 	struct rproc *rproc = dev_get_drvdata(cl->dev);
 	struct stm32_mbox *mb = container_of(cl, struct stm32_mbox, client);
+	struct stm32_rproc *ddata = rproc->priv;
 
-	if (rproc_vq_interrupt(rproc, mb->vq_id) == IRQ_NONE)
-		dev_dbg(&rproc->dev, "no message found in vq%d\n", mb->vq_id);
+	queue_work(ddata->workqueue, &mb->vq_work);
 }
 
 static void stm32_rproc_free_mbox(struct rproc *rproc)
@@ -285,7 +398,7 @@ static void stm32_rproc_free_mbox(struct rproc *rproc)
 static const struct stm32_mbox stm32_rproc_mbox[MBOX_NB_MBX] = {
 	{
 		.name = STM32_MBX_VQ0,
-		.vq_id = 0,
+		.vq_id = STM32_MBX_VQ0_ID,
 		.client = {
 			.rx_callback = stm32_rproc_mb_callback,
 			.tx_block = false,
@@ -293,7 +406,7 @@ static const struct stm32_mbox stm32_rproc_mbox[MBOX_NB_MBX] = {
 	},
 	{
 		.name = STM32_MBX_VQ1,
-		.vq_id = 1,
+		.vq_id = STM32_MBX_VQ1_ID,
 		.client = {
 			.rx_callback = stm32_rproc_mb_callback,
 			.tx_block = false,
@@ -310,7 +423,7 @@ static const struct stm32_mbox stm32_rproc_mbox[MBOX_NB_MBX] = {
 	}
 };
 
-static void stm32_rproc_request_mbox(struct rproc *rproc)
+static int stm32_rproc_request_mbox(struct rproc *rproc)
 {
 	struct stm32_rproc *ddata = rproc->priv;
 	struct device *dev = &rproc->dev;
@@ -329,10 +442,18 @@ static void stm32_rproc_request_mbox(struct rproc *rproc)
 
 		ddata->mb[i].chan = mbox_request_channel_byname(cl, name);
 		if (IS_ERR(ddata->mb[i].chan)) {
+			if (PTR_ERR(ddata->mb[i].chan) == -EPROBE_DEFER)
+				return -EPROBE_DEFER;
 			dev_warn(dev, "cannot get %s mbox\n", name);
 			ddata->mb[i].chan = NULL;
 		}
+		if (ddata->mb[i].vq_id >= 0) {
+			INIT_WORK(&ddata->mb[i].vq_work,
+				  stm32_rproc_mb_vq_work);
+		}
 	}
+
+	return 0;
 }
 
 static int stm32_rproc_set_hold_boot(struct rproc *rproc, bool hold)
@@ -389,7 +510,7 @@ static int stm32_rproc_start(struct rproc *rproc)
 	stm32_rproc_add_coredump_trace(rproc);
 
 	/* clear remote proc Deep Sleep */
-	if (ddata->pdds.map) {
+	if (ddata->pdds.map && !rproc->early_boot) {
 		err = regmap_update_bits(ddata->pdds.map, ddata->pdds.reg,
 					 ddata->pdds.mask, 0);
 		if (err) {
@@ -398,9 +519,15 @@ static int stm32_rproc_start(struct rproc *rproc)
 		}
 	}
 
-	err = stm32_rproc_set_hold_boot(rproc, false);
-	if (err)
-		return err;
+	/*
+	 * If M4 previously started by bootloader, just guarantee holdboot
+	 * is set to catch any crash.
+	 */
+	if (!rproc->early_boot) {
+		err = stm32_rproc_set_hold_boot(rproc, false);
+		if (err)
+			return err;
+	}
 
 	return stm32_rproc_set_hold_boot(rproc, true);
 }
@@ -442,6 +569,21 @@ static int stm32_rproc_stop(struct rproc *rproc)
 		}
 	}
 
+	/* update copro state to OFF */
+	if (ddata->copro_state.map) {
+		err = regmap_update_bits(ddata->copro_state.map,
+					 ddata->copro_state.reg,
+					 ddata->copro_state.mask,
+					 COPRO_STATE_OFF);
+		if (err) {
+			dev_err(&rproc->dev, "failed to set copro state\n");
+			return err;
+		}
+	}
+
+	/* Reset early_boot state as we stop the co-processor */
+	rproc->early_boot = false;
+
 	return 0;
 }
 
@@ -471,11 +613,11 @@ static struct rproc_ops st_rproc_ops = {
 	.start		= stm32_rproc_start,
 	.stop		= stm32_rproc_stop,
 	.kick		= stm32_rproc_kick,
-	.load		= rproc_elf_load_segments,
+	.load		= stm32_rproc_elf_load_segments,
 	.parse_fw	= stm32_rproc_parse_fw,
-	.find_loaded_rsc_table = rproc_elf_find_loaded_rsc_table,
-	.sanity_check	= rproc_elf_sanity_check,
-	.get_boot_addr	= rproc_elf_get_boot_addr,
+	.find_loaded_rsc_table = stm32_rproc_elf_find_loaded_rsc_table,
+	.sanity_check	= stm32_rproc_elf_sanity_check,
+	.get_boot_addr	= stm32_rproc_elf_get_boot_addr,
 };
 
 static const struct of_device_id stm32_rproc_match[] = {
@@ -512,8 +654,10 @@ static int stm32_rproc_parse_dt(struct platform_device *pdev)
 	struct device_node *np = dev->of_node;
 	struct rproc *rproc = platform_get_drvdata(pdev);
 	struct stm32_rproc *ddata = rproc->priv;
-	struct stm32_syscon tz;
-	unsigned int tzen;
+	struct stm32_syscon tz, rsctbl;
+	phys_addr_t rsc_pa;
+	u32 rsc_da;
+	unsigned int tzen, state;
 	int err, irq;
 
 	irq = platform_get_irq(pdev, 0);
@@ -528,12 +672,21 @@ static int stm32_rproc_parse_dt(struct platform_device *pdev)
 			return err;
 		}
 
+		ddata->wdg_irq = irq;
+
+		if (of_property_read_bool(np, "wakeup-source")) {
+			device_init_wakeup(dev, true);
+			dev_pm_set_wake_irq(dev, irq);
+		}
+
 		dev_info(dev, "wdg irq registered\n");
 	}
 
 	ddata->rst = devm_reset_control_get_by_index(dev, 0);
 	if (IS_ERR(ddata->rst)) {
-		dev_err(dev, "failed to get mcu reset\n");
+		if (PTR_ERR(ddata->rst) != -EPROBE_DEFER)
+			dev_err(dev, "failed to get mcu reset\n");
+
 		return PTR_ERR(ddata->rst);
 	}
 
@@ -564,11 +717,62 @@ static int stm32_rproc_parse_dt(struct platform_device *pdev)
 
 	err = stm32_rproc_get_syscon(np, "st,syscfg-pdds", &ddata->pdds);
 	if (err)
-		dev_warn(dev, "failed to get pdds\n");
+		dev_warn(dev, "pdds not supported\n");
 
 	rproc->auto_boot = of_property_read_bool(np, "st,auto-boot");
 
-	return stm32_rproc_of_memory_translations(rproc);
+	err = stm32_rproc_of_memory_translations(rproc);
+	if (err)
+		return err;
+
+	/* check if the coprocessor has been started from the bootloader */
+	err = stm32_rproc_get_syscon(np, "st,syscfg-copro-state",
+				     &ddata->copro_state);
+	if (err) {
+		/* no copro_state syscon (optional) */
+		dev_warn(dev, "copro_state not supported\n");
+		goto bail;
+	}
+
+	err = regmap_read(ddata->copro_state.map, ddata->copro_state.reg,
+			  &state);
+	if (err) {
+		dev_err(&rproc->dev, "failed to read copro state\n");
+		return err;
+	}
+
+	if (state == COPRO_STATE_CRUN) {
+		rproc->early_boot = true;
+
+		if (stm32_rproc_get_syscon(np, "st,syscfg-rsc-tbl", &rsctbl)) {
+			/* no rsc table syscon (optional) */
+			dev_warn(dev, "rsc tbl syscon not supported\n");
+			goto bail;
+		}
+
+		err = regmap_read(rsctbl.map, rsctbl.reg, &rsc_da);
+		if (err) {
+			dev_err(&rproc->dev, "failed to read rsc tbl addr\n");
+			return err;
+		}
+		if (!rsc_da)
+			/* no rsc table */
+			goto bail;
+
+		err = stm32_rproc_da_to_pa(rproc, rsc_da, &rsc_pa);
+		if (err)
+			return err;
+
+		ddata->rsc_va = devm_ioremap_wc(dev, rsc_pa, RSC_TBL_SIZE);
+		if (IS_ERR_OR_NULL(ddata->rsc_va)) {
+			dev_err(dev, "Unable to map memory region: %pa+%zx\n",
+				&rsc_pa, RSC_TBL_SIZE);
+			ddata->rsc_va = NULL;
+			return -ENOMEM;
+		}
+	}
+bail:
+	return 0;
 }
 
 static int stm32_rproc_probe(struct platform_device *pdev)
@@ -589,14 +793,28 @@ static int stm32_rproc_probe(struct platform_device *pdev)
 
 	rproc->has_iommu = false;
 	ddata = rproc->priv;
+	ddata->workqueue = create_workqueue(dev_name(dev));
+	if (!ddata->workqueue) {
+		dev_err(dev, "cannot create workqueue\n");
+		ret = -ENOMEM;
+		goto free_rproc;
+	}
 
 	platform_set_drvdata(pdev, rproc);
 
 	ret = stm32_rproc_parse_dt(pdev);
 	if (ret)
-		goto free_rproc;
+		goto free_wkq;
 
-	stm32_rproc_request_mbox(rproc);
+	if (!rproc->early_boot) {
+		ret = stm32_rproc_stop(rproc);
+		if (ret)
+			goto free_wkq;
+	}
+
+	ret = stm32_rproc_request_mbox(rproc);
+	if (ret)
+		goto free_wkq;
 
 	ret = rproc_add(rproc);
 	if (ret)
@@ -606,7 +824,13 @@ static int stm32_rproc_probe(struct platform_device *pdev)
 
 free_mb:
 	stm32_rproc_free_mbox(rproc);
+free_wkq:
+	destroy_workqueue(ddata->workqueue);
 free_rproc:
+	if (device_may_wakeup(dev)) {
+		dev_pm_clear_wake_irq(dev);
+		device_init_wakeup(dev, false);
+	}
 	rproc_free(rproc);
 	return ret;
 }
@@ -614,22 +838,68 @@ free_rproc:
 static int stm32_rproc_remove(struct platform_device *pdev)
 {
 	struct rproc *rproc = platform_get_drvdata(pdev);
+	struct stm32_rproc *ddata = rproc->priv;
+	struct device *dev = &pdev->dev;
 
 	if (atomic_read(&rproc->power) > 0)
 		rproc_shutdown(rproc);
 
 	rproc_del(rproc);
 	stm32_rproc_free_mbox(rproc);
+	destroy_workqueue(ddata->workqueue);
+
+	if (device_may_wakeup(dev)) {
+		dev_pm_clear_wake_irq(dev);
+		device_init_wakeup(dev, false);
+	}
 	rproc_free(rproc);
 
 	return 0;
 }
 
+static void stm32_rproc_shutdown(struct platform_device *pdev)
+{
+	struct rproc *rproc = platform_get_drvdata(pdev);
+
+	if (atomic_read(&rproc->power) > 0)
+		dev_warn(&pdev->dev,
+		         "Warning: remote fw is still running with possible side effect!!!\n");
+}
+
+#ifdef CONFIG_PM_SLEEP
+static int stm32_rproc_suspend(struct device *dev)
+{
+	struct rproc *rproc = dev_get_drvdata(dev);
+	struct stm32_rproc *ddata = rproc->priv;
+
+	if (device_may_wakeup(dev))
+		return enable_irq_wake(ddata->wdg_irq);
+
+	return 0;
+}
+
+static int stm32_rproc_resume(struct device *dev)
+{
+	struct rproc *rproc = dev_get_drvdata(dev);
+	struct stm32_rproc *ddata = rproc->priv;
+
+	if (device_may_wakeup(dev))
+		return disable_irq_wake(ddata->wdg_irq);
+
+	return 0;
+}
+#endif
+
+static SIMPLE_DEV_PM_OPS(stm32_rproc_pm_ops,
+			 stm32_rproc_suspend, stm32_rproc_resume);
+
 static struct platform_driver stm32_rproc_driver = {
 	.probe = stm32_rproc_probe,
 	.remove = stm32_rproc_remove,
+	.shutdown = stm32_rproc_shutdown,
 	.driver = {
 		.name = "stm32-rproc",
+		.pm = &stm32_rproc_pm_ops,
 		.of_match_table = of_match_ptr(stm32_rproc_match),
 	},
 };

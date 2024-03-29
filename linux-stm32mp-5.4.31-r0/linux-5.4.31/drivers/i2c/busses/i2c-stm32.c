@@ -25,9 +25,11 @@ struct stm32_i2c_dma *stm32_i2c_dma_request(struct device *dev,
 	/* Request and configure I2C TX dma channel */
 	dma->chan_tx = dma_request_chan(dev, "tx");
 	if (IS_ERR(dma->chan_tx)) {
-		dev_dbg(dev, "can't request DMA tx channel\n");
 		ret = PTR_ERR(dma->chan_tx);
-		goto fail_al;
+		if ((ret != -EPROBE_DEFER) && (ret != -ENODEV))
+			dev_err(dev, "can't request DMA tx channel: %d\n", ret);
+
+		goto fail_mem;
 	}
 
 	memset(&dma_sconfig, 0, sizeof(dma_sconfig));
@@ -37,15 +39,17 @@ struct stm32_i2c_dma *stm32_i2c_dma_request(struct device *dev,
 	dma_sconfig.direction = DMA_MEM_TO_DEV;
 	ret = dmaengine_slave_config(dma->chan_tx, &dma_sconfig);
 	if (ret < 0) {
-		dev_err(dev, "can't configure tx channel\n");
+		dev_err(dev, "can't configure tx channel: %d\n", ret);
 		goto fail_tx;
 	}
 
 	/* Request and configure I2C RX dma channel */
 	dma->chan_rx = dma_request_chan(dev, "rx");
 	if (IS_ERR(dma->chan_rx)) {
-		dev_err(dev, "can't request DMA rx channel\n");
 		ret = PTR_ERR(dma->chan_rx);
+		if ((ret != -EPROBE_DEFER) && (ret != -ENODEV))
+			dev_err(dev, "can't request DMA rx channel: %d\n", ret);
+
 		goto fail_tx;
 	}
 
@@ -56,7 +60,7 @@ struct stm32_i2c_dma *stm32_i2c_dma_request(struct device *dev,
 	dma_sconfig.direction = DMA_DEV_TO_MEM;
 	ret = dmaengine_slave_config(dma->chan_rx, &dma_sconfig);
 	if (ret < 0) {
-		dev_err(dev, "can't configure rx channel\n");
+		dev_err(dev, "can't configure rx channel: %d\n", ret);
 		goto fail_rx;
 	}
 
@@ -71,9 +75,10 @@ fail_rx:
 	dma_release_channel(dma->chan_rx);
 fail_tx:
 	dma_release_channel(dma->chan_tx);
-fail_al:
+fail_mem:
 	devm_kfree(dev, dma);
-	dev_info(dev, "can't use DMA\n");
+	if (ret == -ENODEV)
+		dev_info(dev, "doesn't use DMA\n");
 
 	return ERR_PTR(ret);
 }
