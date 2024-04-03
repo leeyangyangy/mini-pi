@@ -1,0 +1,1 @@
+stm32mp1-openstlinux-5.10-dunfell-mp1-21-11-17/images/stm32mp1/kernel/vmlinux filter=lfs diff=lfs merge=lfs -text

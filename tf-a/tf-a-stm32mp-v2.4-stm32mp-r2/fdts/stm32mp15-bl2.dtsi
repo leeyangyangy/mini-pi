@@ -1,0 +1,116 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR BSD-3-Clause)
+/*
+ * Copyright (C) STMicroelectronics 2020 - All Rights Reserved
+ */
+
+/ {
+#if !(STM32MP_EMMC || STM32MP_SDMMC)
+	aliases {
+		/delete-property/ mmc0;
+	};
+#endif
+
+	cpus {
+		/delete-node/ cpu@1;
+	};
+
+	/delete-node/ psci;
+
+	soc {
+		/delete-node/ timer@40006000;
+		/delete-node/ timer@44006000;
+		/delete-node/ pwr_mcu@50001014;
+		/delete-node/ cryp@54001000;
+		/delete-node/ rng@54003000;
+		/delete-node/ spi@5c001000;
+		/delete-node/ rtc@5c004000;
+		/delete-node/ etzpc@5c007000;
+		/delete-node/ stgen@5c008000;
+		/delete-node/ i2c@5c009000;
+		/delete-node/ tamp@5c00a000;
+#if !(STM32MP_EMMC || STM32MP_SDMMC)
+		/delete-node/ sdmmc@58005000;
+		/delete-node/ sdmmc@58007000;
+#endif
+#if !STM32MP_RAW_NAND
+		/delete-node/ memory-controller@58002000;
+#endif
+#if !(STM32MP_SPI_NAND || STM32MP_SPI_NOR)
+		/delete-node/ spi@58003000;
+#endif
+#if !STM32MP_USB_PROGRAMMER
+		/delete-node/ usb-otg@49000000;
+		/delete-node/ usbphyc@5a006000;
+#endif
+
+		pin-controller@50002000 {
+			/delete-node/ rtc-out2-rmp-pins-0;
+#if !(STM32MP_EMMC || STM32MP_SDMMC)
+			/delete-node/ sdmmc1-b4-0;
+			/delete-node/ sdmmc1-dir-0;
+			/delete-node/ sdmmc2-b4-0;
+			/delete-node/ sdmmc2-b4-1;
+			/delete-node/ sdmmc2-d47-0;
+#endif
+#if !STM32MP_RAW_NAND
+			/delete-node/ fmc-0;
+#endif
+#if !(STM32MP_SPI_NAND || STM32MP_SPI_NOR)
+			/delete-node/ qspi-clk-0;
+			/delete-node/ qspi-bk1-0;
+			/delete-node/ qspi-bk2-0;
+#endif
+#if !STM32MP_USB_PROGRAMMER
+			/delete-node/ usbotg_hs-0;
+			/delete-node/ usbotg-fs-dp-dm-0;
+#endif
+		};
+	};
+
+#if !STM32MP_USE_STM32IMAGE
+	/*
+	 * UUID's here are UUID RFC 4122 compliant meaning fieds are stored in
+	 * network order (big endian)
+	 */
+
+	st-io_policies {
+		fip-handles {
+			compatible = "st,io-fip-handle";
+			fw_cfg_uuid = <0x5807e16a 0x845947be 0x8ed5648e 0x8dddab0e>;
+			bl32_uuid = <0x05d0e189 0x53dc1347 0x8d2b500a 0x4b7a3e38>;
+			bl32_extra1_uuid = <0x0b70c29b 0x2a5a7840 0x9f650a56 0x82738288>;
+			bl32_extra2_uuid = <0x8ea87bb1 0xcfa23f4d 0x85fde7bb 0xa50220d9>;
+			bl33_uuid = <0xd6d0eea7 0xfcead54b 0x97829934 0xf234b6e4>;
+			hw_cfg_uuid = <0x08b8f1d9 0xc9cf9349 0xa9626fbc 0x6b7265cc>;
+			tos_fw_cfg_uuid = <0x26257c1a 0xdbc67f47 0x8d96c4c4 0xb0248021>;
+			nt_fw_cfg_uuid = <0x28da9815 0x93e87e44 0xac661aaf 0x801550f9>;
+#if TRUSTED_BOARD_BOOT
+			t_key_cert_uuid = <0x827ee890 0xf860e411 0xa1b4777a 0x21b4f94c>;
+			t_boot_fw_cert_uuid = <0xd6e269ea 0x5d63e411 0x8d8c9fba 0xbe9956a5>;
+			tos_fw_key_cert_uuid = <0x9477d603 0xfb60e411 0x85ddb710 0x5b8cee04>;
+			nt_fw_key_cert_uuid = <0x8ad5832a 0xfb60e411 0x8aafdf30 0xbbc49859>;
+			tos_fw_content_cert_uuid = <0xa49f4411 0x5e63e411 0x87283f05 0x722af33d>;
+			nt_fw_content_cert_uuid = <0x8ec4c1f3 0x5d63e411 0xa7a987ee 0x40b23fa7>;
+#endif
+		};
+	};
+
+#if TRUSTED_BOARD_BOOT
+	tb_fw-config {
+		compatible = "arm,tb_fw";
+
+		/* Disable authentication for development */
+		disable_auth = <0x0>;
+
+		/*
+		 * The following two entries are placeholders for Mbed TLS
+		 * heap information.
+		 */
+		mbedtls_heap_addr = <0x0 0x0>;
+		mbedtls_heap_size = <0x0>;
+	};
+
+#include "cot_descriptors.dtsi"
+#endif
+#endif /* !STM32MP_USE_STM32IMAGE */
+};
