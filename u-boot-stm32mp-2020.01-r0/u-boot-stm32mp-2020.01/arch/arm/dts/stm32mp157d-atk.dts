@@ -14,7 +14,7 @@
 #include "stm32mp157d-atk.dtsi"
 
 / {
-	model = "STMicroelectronics STM32MP157D eval daughter";
+	model = "STMicroelectronics STM32MP157D eval daughter \n by LEEYANGY BUILD TIME:2024年6月27日02点00分";
 	compatible = "st,stm32mp157d-ed1", "st,stm32mp157";
 	
 	chosen {
