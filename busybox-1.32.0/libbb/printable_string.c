@@ -9,7 +9,7 @@
 #include "libbb.h"
 #include "unicode.h"
 
-const char *FAST_FUNC printable_string2(uni_stat_t *stats, const char *str)
+const char* FAST_FUNC printable_string2(uni_stat_t *stats, const char *str)
 {
 	char *dst;
 	const char *s;
@@ -28,9 +28,8 @@ const char *FAST_FUNC printable_string2(uni_stat_t *stats, const char *str)
 		}
 		if (c < ' ')
 			break;
-		/* 注释掉下面这个两行代码 */
-		/* if (c >= 0x7f)
-		break; */
+		// if (c >= 0x7f)
+		// 	break;
 		s++;
 	}
 
@@ -43,7 +42,7 @@ const char *FAST_FUNC printable_string2(uni_stat_t *stats, const char *str)
 			unsigned char c = *d;
 			if (c == '\0')
 				break;
-			/* if (c < ' ' || c >= 0x7f) */
+			// if (c < ' ' || c >= 0x7f)
 			if (c < ' ')
 				*d = '?';
 			d++;
@@ -56,4 +55,9 @@ const char *FAST_FUNC printable_string2(uni_stat_t *stats, const char *str)
 	}
 #endif
 	return auto_string(dst);
+}
+
+const char* FAST_FUNC printable_string(const char *str)
+{
+	return printable_string2(NULL, str);
 }
