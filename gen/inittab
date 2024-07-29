@@ -1,0 +1,13 @@
+#etc/inittab
+# 第 2 行，系统启动以后运行/etc/init.d/rcS 这个脚本文件。
+::sysinit:/etc/init.d/rcS
+# 第 3 行，将 console 作为控制台终端，也就是 ttySTM0。
+console::askfirst:-/bin/sh
+# 第 4 行，重启的话运行/sbin/init。
+::restart:/sbin/init
+# 第 5 行，按下 ctrl+alt+del 组合键的话就运行/sbin/reboot，看来 ctrl+alt+del 组合键用于重启系统。
+::ctrlaltdel:/sbin/reboot
+# 第 6 行，关机的时候执行/bin/umount，也就是卸载各个文件系统。
+::shutdown:/bin/umount -a -r
+# 第 7 行，关机的时候执行/sbin/swapoff，也就是关闭交换分区。
+::shutdown:/sbin/swapoff -a
